@@ -14,7 +14,7 @@ type Dimension = {
 };
 
 type LiveItem = { value: number; date: string; display: string; status: Risk };
-type FredPayload = { source: string; asOf: string; count: number; values: Record<string, LiveItem>; error?: string };
+type FredPayload = { source: string; asOf: string; count: number; values: Record<string, LiveItem>; unavailable?: string[]; error?: string };
 
 const dimensions: Dimension[] = [
   { id: "valuation", name: "估值", en: "VALUATION", weight: 12, score: 72, icon: CircleDollarSign, insight: "定价偏贵，但高估值不能单独触发离场。" },
@@ -78,30 +78,29 @@ export default function Home() {
   const [dataState, setDataState] = useState<"loading" | "live" | "error">("loading");
 
   useEffect(() => {
-    let cancelled = false;
-    const ids = ["DFII10", "NFCI", "DTWEXBGS", "BAMLH0A0HYM2", "BAMLC0A0CM", "T10Y2Y", "ICSA"];
+    const controller = new AbortController();
+
     const load = async () => {
-      const combined: FredPayload = { source: "FRED", asOf: "", count: 0, values: {} };
-      for (const id of ids) {
-        try {
-          const response = await fetch(`/api/fred?series=${id}`);
-          const payload = await response.json() as FredPayload;
-          if (!response.ok) continue;
-          Object.assign(combined.values, payload.values);
-          combined.count = Object.keys(combined.values).length;
-          combined.asOf = [combined.asOf, payload.asOf].filter(Boolean).sort().at(-1) ?? "";
-          if (!cancelled) {
-            setFred({ ...combined, values: { ...combined.values } });
-            setDataState("live");
-          }
-        } catch {
-          // Keep already loaded series visible and continue with the next one.
+      try {
+        const hour = Math.floor(Date.now() / 3_600_000);
+        const response = await fetch(`/api/fred?v=${hour}`, {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        const payload = await response.json() as FredPayload;
+        if (!response.ok || payload.count === 0) {
+          throw new Error(payload.error ?? "FRED returned no data");
         }
+
+        setFred(payload);
+        setDataState("live");
+      } catch {
+        if (!controller.signal.aborted) setDataState("error");
       }
-      if (!cancelled && combined.count === 0) setDataState("error");
     };
+
     load();
-    return () => { cancelled = true; };
+    return () => controller.abort();
   }, []);
 
   const liveRiskPoints: Record<Risk, number> = { 正常: 20, 偏热: 45, 警戒: 68, 高风险: 88 };
