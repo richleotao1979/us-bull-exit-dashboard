@@ -2,26 +2,59 @@ type Risk = "正常" | "偏热" | "警戒" | "高风险";
 
 type Point = { date: string; value: number };
 
-const FRED_BASE = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=";
+const FRED_BASE = "https://fred.stlouisfed.org/graph/fredgraph.csv";
+const SUPPORTED_IDS = ["DFII10", "NFCI", "DTWEXBGS", "BAMLH0A0HYM2", "BAMLC0A0CM", "T10Y2Y", "ICSA"] as const;
 
-async function getSeries(id: string): Promise<Point[]> {
-  let lastStatus = 0;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const response = await fetch(`${FRED_BASE}${encodeURIComponent(id)}&cosd=2025-01-01`, {
-      headers: { "User-Agent": "US-Exit-Risk-Dashboard/1.0" },
-    });
-    lastStatus = response.status;
-    if (response.ok) {
-      const rows = (await response.text()).trim().split(/\r?\n/).slice(1);
-      return rows.flatMap((row) => {
-        const [date, raw] = row.split(",");
-        const value = Number(raw);
-        return date && Number.isFinite(value) ? [{ date, value }] : [];
-      });
+function cleanCell(value: string) {
+  return value.trim().replace(/^"|"$/g, "");
+}
+
+function parseSeriesCsv(csv: string, ids: readonly string[]): Record<string, Point[]> {
+  const rows = csv.trim().split(/\r?\n/);
+  const headers = (rows.shift() ?? "").split(",").map(cleanCell);
+  const columnById = new Map(ids.map((id, index) => [id, headers.indexOf(id) >= 0 ? headers.indexOf(id) : ids.length === 1 ? index + 1 : -1]));
+  const series = Object.fromEntries(ids.map((id) => [id, [] as Point[]])) as Record<string, Point[]>;
+
+  for (const row of rows) {
+    const cells = row.split(",").map(cleanCell);
+    const date = cells[0];
+    if (!date) continue;
+    for (const id of ids) {
+      const column = columnById.get(id) ?? -1;
+      const value = column >= 0 ? Number(cells[column]) : Number.NaN;
+      if (Number.isFinite(value)) series[id].push({ date, value });
     }
-    await new Promise((resolve) => setTimeout(resolve, 350));
   }
-  throw new Error(`FRED ${id}: ${lastStatus}`);
+
+  return series;
+}
+
+async function getSeries(ids: readonly string[]): Promise<Record<string, Point[]>> {
+  let lastStatus = 0;
+  let lastError = "FRED request failed";
+  const idParam = ids.map(encodeURIComponent).join(",");
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await fetch(`${FRED_BASE}?id=${idParam}&cosd=2025-01-01`, {
+        cache: "no-store",
+        headers: {
+          Accept: "text/csv",
+          "User-Agent": "US-Exit-Risk-Dashboard/1.0",
+        },
+        signal: AbortSignal.timeout(12_000),
+      });
+      lastStatus = response.status;
+      if (response.ok) return parseSeriesCsv(await response.text(), ids);
+      lastError = `FRED returned ${response.status}`;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : "FRED request failed";
+    }
+
+    if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+  }
+
+  throw new Error(lastStatus ? `FRED request failed (${lastStatus})` : lastError);
 }
 
 function classify(value: number, levels: [number, number, number]): Risk {
@@ -39,28 +72,16 @@ function latest(points: Point[]) {
 
 export async function GET(request: Request) {
   try {
-    const supportedIds = ["DFII10", "NFCI", "DTWEXBGS", "BAMLH0A0HYM2", "BAMLC0A0CM", "T10Y2Y", "ICSA"];
     const requestedId = new URL(request.url).searchParams.get("series");
-    if (requestedId && !supportedIds.includes(requestedId)) {
+    if (requestedId && !SUPPORTED_IDS.includes(requestedId as (typeof SUPPORTED_IDS)[number])) {
       return Response.json({ error: "Unsupported FRED series" }, { status: 400 });
     }
-    const ids = requestedId ? [requestedId] : supportedIds;
-    const series: Record<string, Point[]> = {};
-    const unavailable: string[] = [];
 
-    // FRED's graph endpoint can reject bursts from a shared cloud address.
-    // Pace requests and retry once; a final single-series failure still does
-    // not blank the rest of the dashboard.
-    for (const id of ids) {
-      try {
-        series[id] = await getSeries(id);
-      } catch {
-        unavailable.push(id);
-      }
-      await new Promise((resolve) => setTimeout(resolve, 150));
-    }
-
+    const ids = requestedId ? [requestedId] : [...SUPPORTED_IDS];
+    const series = await getSeries(ids);
+    const unavailable = ids.filter((id) => !series[id]?.length);
     const values: Record<string, { value: number; date: string; display: string; status: Risk }> = {};
+
     if (series.DFII10?.length) {
       const r = latest(series.DFII10);
       values["Real 10Y Yield"] = { value: r.value, date: r.date, display: `${r.value.toFixed(2)}%`, status: classify(r.value, [1.5, 2.0, 2.3]) };
