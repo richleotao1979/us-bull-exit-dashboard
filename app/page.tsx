@@ -51,7 +51,7 @@ const metrics = [
   ["credit", "IG Credit Spread", "投资级信用利差", "0.91%", "> 1.3%", "正常"],
   ["credit", "10Y–2Y Yield Curve", "10年–2年收益率曲线", "待接入", "三个月快速走陡", "偏热"],
   ["earnings", "Forward EPS Revisions", "盈利预测上调/下调比", "1.04", "< 0.80", "正常"],
-  ["earnings", "Net Margin Outlook", "利润率预期", "高位持平", "连续下修", "偏热"],
+  ["earnings", "Net Margin Outlook", "七大科技预期净利率变化", "高位持平", "下一财年下降", "偏热"],
   ["earnings", "Initial Jobless Claims", "首次申领失业救济人数", "待接入", "> 350K", "正常"],
   ["leaders", "Mega-cap Relative Strength", "大型权重股相对强弱", "分化", "多数破位", "警戒"],
   ["leaders", "Mag 7 EPS Growth", "七大科技盈利增速", "放缓", "转负", "偏热"],
@@ -83,9 +83,10 @@ export default function Home() {
     const load = async () => {
       try {
         const hour = Math.floor(Date.now() / 3_600_000);
-        const endpoints = ["/api/fred", "/api/market"];
+        const endpoints = ["/api/fred", "/api/market", "/api/fmp"];
         const results = await Promise.allSettled(endpoints.map(async (endpoint) => {
-          const response = await fetch(`${endpoint}?v=${hour}`, { cache: "no-store", signal: controller.signal });
+          const version = endpoint === "/api/fmp" ? Math.floor(Date.now() / 86_400_000) : hour;
+          const response = await fetch(`${endpoint}?v=${version}`, { cache: "no-store", signal: controller.signal });
           const payload = await response.json() as DataPayload;
           if (!response.ok || payload.count === 0) throw new Error(payload.error ?? `${endpoint} returned no data`);
           return payload;
