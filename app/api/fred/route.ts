@@ -3,7 +3,7 @@ type Risk = "正常" | "偏热" | "警戒" | "高风险";
 type Point = { date: string; value: number };
 
 const FRED_API_BASE = "https://api.stlouisfed.org/fred/series/observations";
-const SUPPORTED_IDS = ["DFII10", "NFCI", "DTWEXBGS", "BAMLH0A0HYM2", "BAMLC0A0CM", "T10Y2Y", "ICSA"] as const;
+const SUPPORTED_IDS = ["DFII10", "NFCI", "DTWEXBGS", "BAMLH0A0HYM2", "BAMLC0A0CM", "T10Y2Y", "ICSA", "VIXCLS", "VXVCLS"] as const;
 
 async function getSeries(id: string, apiKey: string): Promise<Point[]> {
   let lastStatus = 0;
@@ -108,6 +108,18 @@ export async function GET(request: Request) {
     if (series.ICSA?.length) {
       const j = latest(series.ICSA);
       values["Initial Jobless Claims"] = { value: j.value, date: j.date, display: `${Math.round(j.value / 1000)}K`, status: classify(j.value, [250000, 300000, 350000]) };
+    }
+    if (series.VIXCLS?.length && series.VXVCLS?.length) {
+      const vix = latest(series.VIXCLS);
+      const vix3m = latest(series.VXVCLS);
+      const spread = (vix.value / vix3m.value - 1) * 100;
+      const termRisk: Risk = spread >= 10 ? "高风险" : spread >= 0 ? "警戒" : spread >= -5 ? "偏热" : "正常";
+      values["VIX Term Structure"] = {
+        value: spread,
+        date: vix.date < vix3m.date ? vix.date : vix3m.date,
+        display: spread >= 0 ? `倒挂 +${spread.toFixed(1)}%` : `正价差 ${spread.toFixed(1)}%`,
+        status: termRisk,
+      };
     }
 
     if (!Object.keys(values).length) throw new Error("All FRED series are unavailable");

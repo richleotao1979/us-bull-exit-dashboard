@@ -13,8 +13,8 @@ type Dimension = {
   icon: typeof LineChart; insight: string;
 };
 
-type LiveItem = { value: number; date: string; display: string; status: Risk };
-type FredPayload = { source: string; asOf: string; count: number; values: Record<string, LiveItem>; unavailable?: string[]; error?: string };
+type LiveItem = { value: number; date: string; display: string; status: Risk; source?: string };
+type DataPayload = { source: string; asOf: string; count: number; values: Record<string, LiveItem>; unavailable?: string[]; error?: string };
 
 const dimensions: Dimension[] = [
   { id: "valuation", name: "估值", en: "VALUATION", weight: 12, score: 72, icon: CircleDollarSign, insight: "定价偏贵，但高估值不能单独触发离场。" },
@@ -74,7 +74,7 @@ function scoreMeta(score: number) {
 export default function Home() {
   const [selected, setSelected] = useState("all");
   const [expanded, setExpanded] = useState(true);
-  const [fred, setFred] = useState<FredPayload | null>(null);
+  const [live, setLive] = useState<DataPayload | null>(null);
   const [dataState, setDataState] = useState<"loading" | "live" | "error">("loading");
 
   useEffect(() => {
@@ -83,16 +83,24 @@ export default function Home() {
     const load = async () => {
       try {
         const hour = Math.floor(Date.now() / 3_600_000);
-        const response = await fetch(`/api/fred?v=${hour}`, {
-          cache: "no-store",
-          signal: controller.signal,
+        const endpoints = ["/api/fred", "/api/market"];
+        const results = await Promise.allSettled(endpoints.map(async (endpoint) => {
+          const response = await fetch(`${endpoint}?v=${hour}`, { cache: "no-store", signal: controller.signal });
+          const payload = await response.json() as DataPayload;
+          if (!response.ok || payload.count === 0) throw new Error(payload.error ?? `${endpoint} returned no data`);
+          return payload;
+        }));
+        const payloads = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+        if (!payloads.length) throw new Error("Live data is unavailable");
+        const values = Object.fromEntries(payloads.flatMap((payload) =>
+          Object.entries(payload.values).map(([key, item]) => [key, { ...item, source: item.source ?? payload.source }]),
+        ));
+        setLive({
+          source: payloads.map((payload) => payload.source).join(" + "),
+          asOf: payloads.map((payload) => payload.asOf).sort().at(-1) ?? "",
+          count: Object.keys(values).length,
+          values,
         });
-        const payload = await response.json() as FredPayload;
-        if (!response.ok || payload.count === 0) {
-          throw new Error(payload.error ?? "FRED returned no data");
-        }
-
-        setFred(payload);
         setDataState("live");
       } catch {
         if (!controller.signal.aborted) setDataState("error");
@@ -105,11 +113,11 @@ export default function Home() {
 
   const liveRiskPoints: Record<Risk, number> = { 正常: 20, 偏热: 45, 警戒: 68, 高风险: 88 };
   const displayDimensions = useMemo(() => dimensions.map((dimension) => {
-    if (!fred || !["liquidity", "credit"].includes(dimension.id)) return dimension;
-    const liveRows = metrics.filter((m) => m[0] === dimension.id).map((m) => fred.values[m[1]]).filter(Boolean);
+    if (!live || !["technical", "liquidity", "credit"].includes(dimension.id)) return dimension;
+    const liveRows = metrics.filter((m) => m[0] === dimension.id).map((m) => live.values[m[1]]).filter(Boolean);
     if (!liveRows.length) return dimension;
     return { ...dimension, score: Math.round(liveRows.reduce((sum, item) => sum + liveRiskPoints[item.status], 0) / liveRows.length) };
-  }), [fred]);
+  }), [live]);
   const score = Math.round(displayDimensions.reduce((sum, d) => sum + d.score * d.weight, 0) / 100);
   const meta = scoreMeta(score);
   const visibleMetrics = useMemo(
@@ -119,7 +127,7 @@ export default function Home() {
   const creditLiquidityTriggered = displayDimensions.filter((d) => ["liquidity", "credit"].includes(d.id)).some((d) => d.score >= 70);
   const confirmations = 1 + (creditLiquidityTriggered ? 1 : 0);
   const shouldExit = confirmations >= 2;
-  const displayDate = fred?.asOf ? fred.asOf.replaceAll("-", ".") : "等待数据";
+  const displayDate = live?.asOf ? live.asOf.replaceAll("-", ".") : "等待数据";
 
   return (
     <main>
@@ -128,7 +136,7 @@ export default function Home() {
           <span className="brand-mark"><TrendingDown size={20} /></span>
           <div><strong>US EXIT RISK</strong><span>美股牛市逃顶仪表盘</span></div>
         </div>
-        <div className={`live ${dataState}`}><Radio size={14} /><span>{dataState === "live" ? `${fred?.count}项真实数据 · FRED` : dataState === "loading" ? "正在连接FRED" : "FRED暂时不可用"}</span><time>{displayDate}</time></div>
+        <div className={`live ${dataState}`}><Radio size={14} /><span>{dataState === "live" ? `${live?.count}项真实数据 · 多源` : dataState === "loading" ? "正在连接数据源" : "实时数据暂时不可用"}</span><time>{displayDate}</time></div>
       </header>
 
       <div className="shell">
@@ -192,7 +200,7 @@ export default function Home() {
               <thead><tr><th>#</th><th>所属维度</th><th>指标</th><th>当前数值</th><th>高风险参考</th><th>状态</th></tr></thead>
               <tbody>{visibleMetrics.map((m, i) => {
                 const dim = displayDimensions.find(d => d.id === m[0])!;
-                const liveItem = fred?.values[m[1]];
+                const liveItem = live?.values[m[1]];
                 const currentValue = liveItem?.display ?? m[3];
                 const currentRisk = liveItem?.status ?? m[5];
                 return (
@@ -200,7 +208,7 @@ export default function Home() {
                     <td>{String(i + 1).padStart(2, "0")}</td>
                     <td><span className="dim-pill">{dim.name}</span></td>
                     <td><strong>{m[1]}</strong><small>{m[2]}</small></td>
-                    <td className="current">{currentValue}{liveItem && <small className="source-badge">FRED · {liveItem.date}</small>}</td><td>{m[4]}</td>
+                    <td className="current">{currentValue}{liveItem && <small className="source-badge">{liveItem.source} · {liveItem.date}</small>}</td><td>{m[4]}</td>
                     <td><span className={`risk-pill ${riskStyle[currentRisk as Risk]}`}><i />{currentRisk}</span></td>
                   </tr>
                 );
@@ -211,7 +219,7 @@ export default function Home() {
 
         <footer>
           <p>模型用途：识别牛市末期风险区间，不预测单日最高点。</p>
-          <p>带有“FRED”标识的项目为自动更新真实数据；其余仍为模型示范值，不构成投资建议。</p>
+          <p>带有数据源和日期标识的项目为自动更新真实数据；其余仍为模型示范值，不构成投资建议。</p>
         </footer>
       </div>
     </main>
