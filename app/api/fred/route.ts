@@ -21,12 +21,57 @@ function parseSeriesCsv(csv: string, ids: readonly string[]): Record<string, Poi
     if (!date) continue;
     for (const id of ids) {
       const column = columnById.get(id) ?? -1;
-      const value = column >= 0 ? Number(cells[column]) : Number.NaN;
+      const raw = column >= 0 ? cells[column] : "";
+      const value = raw && raw !== "." ? Number(raw) : Number.NaN;
       if (Number.isFinite(value)) series[id].push({ date, value });
     }
   }
 
   return series;
+}
+
+async function readCsvPayload(payload: ArrayBuffer): Promise<string[]> {
+  const bytes = new Uint8Array(payload);
+  const view = new DataView(payload);
+  const decoder = new TextDecoder();
+
+  if (bytes[0] !== 0x50 || bytes[1] !== 0x4b) {
+    return [decoder.decode(bytes)];
+  }
+
+  const csvFiles: string[] = [];
+  let offset = 0;
+  while (offset + 30 <= bytes.length && view.getUint32(offset, true) === 0x04034b50) {
+    const flags = view.getUint16(offset + 6, true);
+    const method = view.getUint16(offset + 8, true);
+    const compressedSize = view.getUint32(offset + 18, true);
+    const nameLength = view.getUint16(offset + 26, true);
+    const extraLength = view.getUint16(offset + 28, true);
+    if ((flags & 0x08) !== 0) throw new Error("Unsupported FRED ZIP data descriptor");
+
+    const nameStart = offset + 30;
+    const dataStart = nameStart + nameLength + extraLength;
+    const dataEnd = dataStart + compressedSize;
+    if (dataEnd > bytes.length) throw new Error("Invalid FRED ZIP payload");
+
+    const name = decoder.decode(bytes.subarray(nameStart, nameStart + nameLength));
+    if (name.toLowerCase().endsWith(".csv")) {
+      const compressed = bytes.slice(dataStart, dataEnd);
+      if (method === 0) {
+        csvFiles.push(decoder.decode(compressed));
+      } else if (method === 8) {
+        const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+        csvFiles.push(await new Response(stream).text());
+      } else {
+        throw new Error(`Unsupported FRED ZIP compression (${method})`);
+      }
+    }
+
+    offset = dataEnd;
+  }
+
+  if (!csvFiles.length) throw new Error("FRED ZIP contains no CSV files");
+  return csvFiles;
 }
 
 async function getSeries(ids: readonly string[]): Promise<Record<string, Point[]>> {
@@ -45,7 +90,14 @@ async function getSeries(ids: readonly string[]): Promise<Record<string, Point[]
         signal: AbortSignal.timeout(12_000),
       });
       lastStatus = response.status;
-      if (response.ok) return parseSeriesCsv(await response.text(), ids);
+      if (response.ok) {
+        const result = Object.fromEntries(ids.map((id) => [id, [] as Point[]])) as Record<string, Point[]>;
+        for (const csv of await readCsvPayload(await response.arrayBuffer())) {
+          const parsed = parseSeriesCsv(csv, ids);
+          for (const id of ids) result[id].push(...parsed[id]);
+        }
+        return result;
+      }
       lastError = `FRED returned ${response.status}`;
     } catch (error) {
       lastError = error instanceof Error ? error.message : "FRED request failed";
@@ -76,12 +128,11 @@ export async function GET(request: Request) {
     if (requestedId && !SUPPORTED_IDS.includes(requestedId as (typeof SUPPORTED_IDS)[number])) {
       return Response.json({ error: "Unsupported FRED series" }, { status: 400 });
     }
-
     const ids = requestedId ? [requestedId] : [...SUPPORTED_IDS];
     const series = await getSeries(ids);
     const unavailable = ids.filter((id) => !series[id]?.length);
-    const values: Record<string, { value: number; date: string; display: string; status: Risk }> = {};
 
+    const values: Record<string, { value: number; date: string; display: string; status: Risk }> = {};
     if (series.DFII10?.length) {
       const r = latest(series.DFII10);
       values["Real 10Y Yield"] = { value: r.value, date: r.date, display: `${r.value.toFixed(2)}%`, status: classify(r.value, [1.5, 2.0, 2.3]) };
