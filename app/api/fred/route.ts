@@ -2,101 +2,32 @@ type Risk = "正常" | "偏热" | "警戒" | "高风险";
 
 type Point = { date: string; value: number };
 
-const FRED_BASE = "https://fred.stlouisfed.org/graph/fredgraph.csv";
+const FRED_API_BASE = "https://api.stlouisfed.org/fred/series/observations";
 const SUPPORTED_IDS = ["DFII10", "NFCI", "DTWEXBGS", "BAMLH0A0HYM2", "BAMLC0A0CM", "T10Y2Y", "ICSA"] as const;
 
-function cleanCell(value: string) {
-  return value.trim().replace(/^"|"$/g, "");
-}
-
-function parseSeriesCsv(csv: string, ids: readonly string[]): Record<string, Point[]> {
-  const rows = csv.trim().split(/\r?\n/);
-  const headers = (rows.shift() ?? "").split(",").map(cleanCell);
-  const columnById = new Map(ids.map((id, index) => [id, headers.indexOf(id) >= 0 ? headers.indexOf(id) : ids.length === 1 ? index + 1 : -1]));
-  const series = Object.fromEntries(ids.map((id) => [id, [] as Point[]])) as Record<string, Point[]>;
-
-  for (const row of rows) {
-    const cells = row.split(",").map(cleanCell);
-    const date = cells[0];
-    if (!date) continue;
-    for (const id of ids) {
-      const column = columnById.get(id) ?? -1;
-      const raw = column >= 0 ? cells[column] : "";
-      const value = raw && raw !== "." ? Number(raw) : Number.NaN;
-      if (Number.isFinite(value)) series[id].push({ date, value });
-    }
-  }
-
-  return series;
-}
-
-async function readCsvPayload(payload: ArrayBuffer): Promise<string[]> {
-  const bytes = new Uint8Array(payload);
-  const view = new DataView(payload);
-  const decoder = new TextDecoder();
-
-  if (bytes[0] !== 0x50 || bytes[1] !== 0x4b) {
-    return [decoder.decode(bytes)];
-  }
-
-  const csvFiles: string[] = [];
-  let offset = 0;
-  while (offset + 30 <= bytes.length && view.getUint32(offset, true) === 0x04034b50) {
-    const flags = view.getUint16(offset + 6, true);
-    const method = view.getUint16(offset + 8, true);
-    const compressedSize = view.getUint32(offset + 18, true);
-    const nameLength = view.getUint16(offset + 26, true);
-    const extraLength = view.getUint16(offset + 28, true);
-    if ((flags & 0x08) !== 0) throw new Error("Unsupported FRED ZIP data descriptor");
-
-    const nameStart = offset + 30;
-    const dataStart = nameStart + nameLength + extraLength;
-    const dataEnd = dataStart + compressedSize;
-    if (dataEnd > bytes.length) throw new Error("Invalid FRED ZIP payload");
-
-    const name = decoder.decode(bytes.subarray(nameStart, nameStart + nameLength));
-    if (name.toLowerCase().endsWith(".csv")) {
-      const compressed = bytes.slice(dataStart, dataEnd);
-      if (method === 0) {
-        csvFiles.push(decoder.decode(compressed));
-      } else if (method === 8) {
-        const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
-        csvFiles.push(await new Response(stream).text());
-      } else {
-        throw new Error(`Unsupported FRED ZIP compression (${method})`);
-      }
-    }
-
-    offset = dataEnd;
-  }
-
-  if (!csvFiles.length) throw new Error("FRED ZIP contains no CSV files");
-  return csvFiles;
-}
-
-async function getSeries(ids: readonly string[]): Promise<Record<string, Point[]>> {
+async function getSeries(id: string, apiKey: string): Promise<Point[]> {
   let lastStatus = 0;
   let lastError = "FRED request failed";
-  const idParam = ids.map(encodeURIComponent).join(",");
+  const url = new URL(FRED_API_BASE);
+  url.searchParams.set("series_id", id);
+  url.searchParams.set("api_key", apiKey);
+  url.searchParams.set("file_type", "json");
+  url.searchParams.set("observation_start", "2025-01-01");
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      const response = await fetch(`${FRED_BASE}?id=${idParam}&cosd=2025-01-01`, {
+      const response = await fetch(url, {
         cache: "no-store",
-        headers: {
-          Accept: "text/csv",
-          "User-Agent": "US-Exit-Risk-Dashboard/1.0",
-        },
+        headers: { Accept: "application/json" },
         signal: AbortSignal.timeout(12_000),
       });
       lastStatus = response.status;
       if (response.ok) {
-        const result = Object.fromEntries(ids.map((id) => [id, [] as Point[]])) as Record<string, Point[]>;
-        for (const csv of await readCsvPayload(await response.arrayBuffer())) {
-          const parsed = parseSeriesCsv(csv, ids);
-          for (const id of ids) result[id].push(...parsed[id]);
-        }
-        return result;
+        const payload = await response.json() as { observations?: Array<{ date: string; value: string }> };
+        return (payload.observations ?? []).flatMap(({ date, value: raw }) => {
+          const value = raw && raw !== "." ? Number(raw) : Number.NaN;
+          return date && Number.isFinite(value) ? [{ date, value }] : [];
+        });
       }
       lastError = `FRED returned ${response.status}`;
     } catch (error) {
@@ -124,12 +55,21 @@ function latest(points: Point[]) {
 
 export async function GET(request: Request) {
   try {
+    const apiKey = process.env.FRED_API_KEY;
+    if (!apiKey || !/^[a-z0-9]{32}$/.test(apiKey)) {
+      return Response.json({ error: "FRED API key is not configured" }, { status: 503 });
+    }
+
     const requestedId = new URL(request.url).searchParams.get("series");
     if (requestedId && !SUPPORTED_IDS.includes(requestedId as (typeof SUPPORTED_IDS)[number])) {
       return Response.json({ error: "Unsupported FRED series" }, { status: 400 });
     }
     const ids = requestedId ? [requestedId] : [...SUPPORTED_IDS];
-    const series = await getSeries(ids);
+    const series: Record<string, Point[]> = {};
+    const results = await Promise.allSettled(ids.map(async (id) => [id, await getSeries(id, apiKey)] as const));
+    for (const result of results) {
+      if (result.status === "fulfilled") series[result.value[0]] = result.value[1];
+    }
     const unavailable = ids.filter((id) => !series[id]?.length);
 
     const values: Record<string, { value: number; date: string; display: string; status: Risk }> = {};
